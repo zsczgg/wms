@@ -45,6 +45,7 @@ const seedDb = {
   inventory: [
     {
       id: "sku-001",
+      productInternalId: "1700000000001",
       ownerId: "client-aurora",
       sku: "AURORA-CASE-01",
       name: "磁吸手机壳 透明款",
@@ -55,6 +56,7 @@ const seedDb = {
     },
     {
       id: "sku-002",
+      productInternalId: "1700000000002",
       ownerId: "client-aurora",
       sku: "AURORA-CABLE-C",
       name: "Type-C 编织快充线",
@@ -82,6 +84,7 @@ const seedDb = {
       updatedAt: new Date().toISOString()
     }
   ],
+  auditLogs: [],
   sessions: []
 };
 
@@ -96,7 +99,35 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf-8"));
+  const db = JSON.parse(await readFile(DB_FILE, "utf-8"));
+  let changed = false;
+  if (!Array.isArray(db.auditLogs)) {
+    db.auditLogs = [];
+    changed = true;
+  }
+  if (Array.isArray(db.inventory)) {
+    for (const item of db.inventory) {
+      if (!item.status) {
+        item.status = "normal";
+        changed = true;
+      }
+      if (!item.productInternalId) {
+        item.productInternalId = nextProductInternalId(db);
+        appendAuditLog(db, {
+          actorId: "system",
+          action: "product.id.backfill",
+          entityType: "product",
+          entityId: item.id,
+          productInternalId: item.productInternalId,
+          summary: `系统为商品 ${item.sku || item.name || item.id} 补生成内部产品ID`,
+          snapshot: item
+        });
+        changed = true;
+      }
+    }
+  }
+  if (changed) await writeDb(db);
+  return db;
 }
 
 async function writeDb(db) {
@@ -122,6 +153,10 @@ async function readBody(req) {
 function publicUser(user) {
   const { password, ...rest } = user;
   return rest;
+}
+
+function adminUser(user) {
+  return { ...publicUser(user), password: user.password || "" };
 }
 
 function requireFields(body, fields) {
@@ -156,20 +191,113 @@ function assertRole(auth, role) {
 }
 
 function normalizeRequestType(type) {
-  if (["inbound", "return", "dropship"].includes(type)) return type;
+  if (["product_create", "inbound", "return", "dropship"].includes(type)) return type;
   return "inbound";
 }
 
 function typeLabel(type) {
-  return { inbound: "入库", return: "退仓", dropship: "代发" }[type] || "申请";
+  return { product_create: "新增商品", inbound: "入库", return: "退仓", dropship: "代发" }[type] || "申请";
 }
 
 function requestTitle(type, quantity, productName) {
+  if (type === "product_create") return `${typeLabel(type)} ${productName || "货品"}`;
   return `${typeLabel(type)} ${Number(quantity || 0)} 件 ${productName || "货品"}`;
+}
+
+function normalizeSku(value) {
+  return String(value || "").trim();
+}
+
+function findInventoryItem(db, ownerId, sku) {
+  return db.inventory.find((item) => item.ownerId === ownerId && item.sku === normalizeSku(sku));
+}
+
+function inventoryStatus(value) {
+  return value === "frozen" ? "frozen" : "normal";
+}
+
+function createInventoryItem(db, body, actorId) {
+  const item = {
+    id: randomUUID(),
+    productInternalId: nextProductInternalId(db),
+    ownerId: String(body.ownerId).trim(),
+    sku: normalizeSku(body.sku),
+    name: String(body.name || body.productName || "").trim(),
+    location: String(body.location || "待上架").trim(),
+    quantity: Math.max(0, Number(body.quantity || 0)),
+    locked: Number(body.locked || 0),
+    status: inventoryStatus(body.status),
+    updatedAt: now()
+  };
+  db.inventory.push(item);
+  appendAuditLog(db, {
+    actorId,
+    action: "product.create",
+    entityType: "product",
+    entityId: item.id,
+    productInternalId: item.productInternalId,
+    summary: `新增商品 ${item.productInternalId} / ${item.sku}`,
+    snapshot: item
+  });
+  return item;
 }
 
 function now() {
   return new Date().toISOString();
+}
+
+function nextProductInternalId(db) {
+  const used = new Set((db.inventory || []).map((item) => String(item.productInternalId || "")));
+  for (const log of db.auditLogs || []) {
+    if (log.productInternalId) used.add(String(log.productInternalId));
+    if (log.snapshot?.productInternalId) used.add(String(log.snapshot.productInternalId));
+  }
+  let candidate = Date.now();
+  while (used.has(String(candidate).padStart(13, "0").slice(-13))) {
+    candidate += 1;
+  }
+  return String(candidate).padStart(13, "0").slice(-13);
+}
+
+function appendAuditLog(db, entry) {
+  if (!Array.isArray(db.auditLogs)) db.auditLogs = [];
+  db.auditLogs.push({
+    id: randomUUID(),
+    createdAt: now(),
+    actorId: entry.actorId,
+    action: entry.action,
+    entityType: entry.entityType,
+    entityId: entry.entityId,
+    productInternalId: entry.productInternalId || "",
+    summary: entry.summary || "",
+    snapshot: entry.snapshot || null
+  });
+}
+
+function actorInfo(db, actorId) {
+  const user = db.users.find((item) => item.id === actorId);
+  return user
+    ? { id: user.id, username: user.username, name: user.name, company: user.company, role: user.role }
+    : { id: actorId, username: actorId, name: actorId, company: "", role: "" };
+}
+
+function withLogActors(db, logs) {
+  return logs.map((log) => ({ ...log, actor: actorInfo(db, log.actorId) }));
+}
+
+function filterAuditLogs(logs, url) {
+  const query = String(url.searchParams.get("query") || "").trim().toLowerCase();
+  const from = String(url.searchParams.get("from") || "").trim();
+  const to = String(url.searchParams.get("to") || "").trim();
+  return logs
+    .filter((log) => {
+      const createdAt = log.createdAt || "";
+      if (from && createdAt < `${from}T00:00:00.000Z`) return false;
+      if (to && createdAt > `${to}T23:59:59.999Z`) return false;
+      if (!query) return true;
+      return JSON.stringify(log).toLowerCase().includes(query);
+    })
+    .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
 }
 
 async function handleApi(req, res, url) {
@@ -226,17 +354,27 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/client/requests" && req.method === "POST") {
     assertRole(auth, "client");
-    requireFields(body, ["type", "sku", "productName", "quantity"]);
     const type = normalizeRequestType(body.type);
+    requireFields(body, type === "product_create" ? ["sku", "productName"] : ["type", "sku", "productName", "quantity"]);
+    const product = findInventoryItem(db, auth.user.id, body.sku);
+    if (type === "product_create" && product) {
+      return sendJson(res, 409, { error: "该商品已经存在，请直接创建入库单" });
+    }
+    if (type !== "product_create" && !product) {
+      return sendJson(res, 400, { error: "请先申请新增商品，审批通过后才能创建该商品的入库单" });
+    }
+    if (type !== "product_create" && product.status !== "normal") {
+      return sendJson(res, 400, { error: "该商品当前为冻结状态，暂时不能创建申请" });
+    }
     const request = {
       id: randomUUID(),
       ownerId: auth.user.id,
       type,
       status: "pending",
       title: requestTitle(type, body.quantity, body.productName),
-      sku: String(body.sku).trim(),
-      productName: String(body.productName).trim(),
-      quantity: Math.max(1, Number(body.quantity || 1)),
+      sku: normalizeSku(body.sku),
+      productName: String(body.productName || product?.name || "").trim(),
+      quantity: type === "product_create" ? 0 : Math.max(1, Number(body.quantity || 1)),
       trackingNo: String(body.trackingNo || "").trim(),
       receiver: String(body.receiver || "").trim(),
       address: String(body.address || "").trim(),
@@ -251,7 +389,7 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/admin/summary" && req.method === "GET") {
     assertRole(auth, "admin");
-    const clients = db.users.filter((item) => item.role === "client").map(publicUser);
+    const clients = db.users.filter((item) => item.role === "client").map(adminUser);
     const requests = db.requests
       .map((item) => ({
         ...item,
@@ -271,6 +409,11 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (url.pathname === "/api/admin/logs" && req.method === "GET") {
+    assertRole(auth, "admin");
+    return sendJson(res, 200, { logs: withLogActors(db, filterAuditLogs(db.auditLogs || [], url)) });
+  }
+
   if (url.pathname === "/api/admin/clients" && req.method === "POST") {
     assertRole(auth, "admin");
     requireFields(body, ["company", "name", "username", "password"]);
@@ -288,36 +431,132 @@ async function handleApi(req, res, url) {
       createdAt: now()
     };
     db.users.push(user);
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "client.create",
+      entityType: "client",
+      entityId: user.id,
+      summary: `新增客户 ${user.company}（${user.username}）`,
+      snapshot: adminUser(user)
+    });
     await writeDb(db);
-    return sendJson(res, 201, { user: publicUser(user) });
+    return sendJson(res, 201, { user: adminUser(user) });
+  }
+
+  const clientMatch = url.pathname.match(/^\/api\/admin\/clients\/([^/]+)$/);
+  if (clientMatch && req.method === "PATCH") {
+    assertRole(auth, "admin");
+    const user = db.users.find((item) => item.id === clientMatch[1] && item.role === "client");
+    if (!user) return sendJson(res, 404, { error: "客户不存在" });
+    const username = String(body.username || user.username).trim();
+    if (db.users.some((item) => item.id !== user.id && item.username === username)) {
+      return sendJson(res, 409, { error: "登录账号已存在" });
+    }
+    const before = adminUser(user);
+    user.company = String(body.company || user.company).trim();
+    user.name = String(body.name || user.name).trim();
+    user.username = username;
+    if (String(body.password || "").trim()) user.password = String(body.password).trim();
+    if (["active", "disabled"].includes(body.status)) user.status = body.status;
+    user.updatedAt = now();
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "client.update",
+      entityType: "client",
+      entityId: user.id,
+      summary: `修改客户 ${user.company}（${user.username}）`,
+      snapshot: { before, after: adminUser(user) }
+    });
+    await writeDb(db);
+    return sendJson(res, 200, { user: adminUser(user) });
+  }
+
+  if (clientMatch && req.method === "DELETE") {
+    assertRole(auth, "admin");
+    const index = db.users.findIndex((item) => item.id === clientMatch[1] && item.role === "client");
+    if (index === -1) return sendJson(res, 404, { error: "客户不存在" });
+    const [user] = db.users.splice(index, 1);
+    db.sessions = db.sessions.filter((item) => item.userId !== user.id);
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "client.delete",
+      entityType: "client",
+      entityId: user.id,
+      summary: `删除客户 ${user.company}（${user.username}）`,
+      snapshot: adminUser(user)
+    });
+    await writeDb(db);
+    return sendJson(res, 200, { ok: true });
   }
 
   if (url.pathname === "/api/admin/inventory" && req.method === "POST") {
     assertRole(auth, "admin");
     requireFields(body, ["ownerId", "sku", "name", "quantity"]);
     const quantity = Number(body.quantity || 0);
-    const existing = db.inventory.find(
-      (item) => item.ownerId === body.ownerId && item.sku === String(body.sku).trim()
-    );
+    const existing = findInventoryItem(db, String(body.ownerId).trim(), body.sku);
+    const before = existing ? { ...existing } : null;
     if (existing) {
       existing.quantity = Math.max(0, Number(existing.quantity || 0) + quantity);
       existing.name = String(body.name).trim();
       existing.location = String(body.location || existing.location || "待上架").trim();
       existing.updatedAt = now();
     } else {
-      db.inventory.push({
-        id: randomUUID(),
-        ownerId: String(body.ownerId).trim(),
-        sku: String(body.sku).trim(),
-        name: String(body.name).trim(),
-        location: String(body.location || "待上架").trim(),
-        quantity: Math.max(0, quantity),
-        locked: Number(body.locked || 0),
-        updatedAt: now()
+      createInventoryItem(db, body, auth.user.id);
+    }
+    const changedItem = findInventoryItem(db, String(body.ownerId).trim(), body.sku);
+    if (existing) {
+      appendAuditLog(db, {
+        actorId: auth.user.id,
+        action: "product.update",
+        entityType: "product",
+        entityId: changedItem?.id || "",
+        productInternalId: changedItem?.productInternalId || "",
+        summary: `更新商品 ${changedItem?.productInternalId || ""} / ${changedItem?.sku || ""}`,
+        snapshot: { before, after: changedItem || null }
       });
     }
     await writeDb(db);
     return sendJson(res, 201, { inventory: db.inventory });
+  }
+
+  const inventoryMatch = url.pathname.match(/^\/api\/admin\/inventory\/([^/]+)$/);
+  if (inventoryMatch && req.method === "DELETE") {
+    assertRole(auth, "admin");
+    const index = db.inventory.findIndex((item) => item.id === inventoryMatch[1]);
+    if (index === -1) return sendJson(res, 404, { error: "商品不存在" });
+    const [item] = db.inventory.splice(index, 1);
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "product.delete",
+      entityType: "product",
+      entityId: item.id,
+      productInternalId: item.productInternalId,
+      summary: `删除商品 ${item.productInternalId || ""} / ${item.sku}`,
+      snapshot: item
+    });
+    await writeDb(db);
+    return sendJson(res, 200, { ok: true });
+  }
+
+  const inventoryStatusMatch = url.pathname.match(/^\/api\/admin\/inventory\/([^/]+)\/status$/);
+  if (inventoryStatusMatch && req.method === "PATCH") {
+    assertRole(auth, "admin");
+    const item = db.inventory.find((entry) => entry.id === inventoryStatusMatch[1]);
+    if (!item) return sendJson(res, 404, { error: "商品不存在" });
+    const before = { ...item };
+    item.status = inventoryStatus(body.status);
+    item.updatedAt = now();
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "product.status.update",
+      entityType: "product",
+      entityId: item.id,
+      productInternalId: item.productInternalId,
+      summary: `修改商品状态 ${item.productInternalId || ""} / ${item.sku}`,
+      snapshot: { before, after: item }
+    });
+    await writeDb(db);
+    return sendJson(res, 200, { item });
   }
 
   const requestStatusMatch = url.pathname.match(/^\/api\/admin\/requests\/([^/]+)\/status$/);
@@ -328,9 +567,64 @@ async function handleApi(req, res, url) {
     const status = ["pending", "approved", "processing", "done", "rejected"].includes(body.status)
       ? body.status
       : "pending";
+    const before = { ...request };
+    if (request.type === "product_create" && ["approved", "processing", "done"].includes(status)) {
+      const existing = findInventoryItem(db, request.ownerId, request.sku);
+      if (!existing) {
+        createInventoryItem(
+          db,
+          {
+            ownerId: request.ownerId,
+            sku: request.sku,
+            name: request.productName,
+            quantity: 0,
+            location: "待上架"
+          },
+          auth.user.id
+        );
+      } else {
+        const productBefore = { ...existing };
+        existing.status = "normal";
+        existing.updatedAt = now();
+        appendAuditLog(db, {
+          actorId: auth.user.id,
+          action: "product.status.update",
+          entityType: "product",
+          entityId: existing.id,
+          productInternalId: existing.productInternalId,
+          summary: `修改商品状态 ${existing.productInternalId || ""} / ${existing.sku}`,
+          snapshot: { before: productBefore, after: existing }
+        });
+      }
+    }
+    if (request.type === "product_create" && before.status !== "rejected" && status === "rejected") {
+      const product = findInventoryItem(db, request.ownerId, request.sku);
+      if (product) {
+        const productBefore = { ...product };
+        product.status = "frozen";
+        product.updatedAt = now();
+        appendAuditLog(db, {
+          actorId: auth.user.id,
+          action: "product.status.update",
+          entityType: "product",
+          entityId: product.id,
+          productInternalId: product.productInternalId,
+          summary: `修改商品状态 ${product.productInternalId || ""} / ${product.sku}`,
+          snapshot: { before: productBefore, after: product }
+        });
+      }
+    }
     request.status = status;
     request.adminNote = String(body.adminNote || request.adminNote || "").trim();
     request.updatedAt = now();
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "request.status.update",
+      entityType: "request",
+      entityId: request.id,
+      summary: `修改申请状态 ${request.title}`,
+      snapshot: { before, after: request }
+    });
     await writeDb(db);
     return sendJson(res, 200, { request });
   }
