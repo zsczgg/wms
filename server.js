@@ -84,6 +84,7 @@ const seedDb = {
       updatedAt: new Date().toISOString()
     }
   ],
+  addresses: [],
   auditLogs: [],
   sessions: []
 };
@@ -103,6 +104,10 @@ async function readDb() {
   let changed = false;
   if (!Array.isArray(db.auditLogs)) {
     db.auditLogs = [];
+    changed = true;
+  }
+  if (!Array.isArray(db.addresses)) {
+    db.addresses = [];
     changed = true;
   }
   if (Array.isArray(db.inventory)) {
@@ -159,10 +164,24 @@ function adminUser(user) {
   return { ...publicUser(user), password: user.password || "" };
 }
 
+const fieldLabels = {
+  username: "账号",
+  password: "密码",
+  company: "客户公司",
+  name: "名称",
+  ownerId: "客户",
+  sku: "SKU",
+  productName: "货品名称",
+  quantity: "数量",
+  label: "地址名称",
+  receiver: "收件人",
+  address: "详细地址"
+};
+
 function requireFields(body, fields) {
   const missing = fields.filter((field) => !String(body[field] || "").trim());
   if (missing.length) {
-    const error = new Error(`缺少字段：${missing.join(", ")}`);
+    const error = new Error(`请填写${missing.map((field) => fieldLabels[field] || field).join("、")}`);
     error.status = 400;
     throw error;
   }
@@ -191,16 +210,17 @@ function assertRole(auth, role) {
 }
 
 function normalizeRequestType(type) {
-  if (["product_create", "inbound", "return", "dropship"].includes(type)) return type;
+  if (["product_create", "product_delete", "inbound", "return", "dropship"].includes(type)) return type;
   return "inbound";
 }
 
 function typeLabel(type) {
-  return { product_create: "新增商品", inbound: "入库", return: "退仓", dropship: "代发" }[type] || "申请";
+  return { product_create: "新增商品", product_delete: "删除商品", inbound: "入库", return: "退仓", dropship: "代发" }[type] || "申请";
 }
 
 function requestTitle(type, quantity, productName) {
   if (type === "product_create") return `${typeLabel(type)} ${productName || "货品"}`;
+  if (type === "product_delete") return `${typeLabel(type)} ${productName || "货品"}`;
   return `${typeLabel(type)} ${Number(quantity || 0)} 件 ${productName || "货品"}`;
 }
 
@@ -214,6 +234,10 @@ function findInventoryItem(db, ownerId, sku) {
 
 function inventoryStatus(value) {
   return value === "frozen" ? "frozen" : "normal";
+}
+
+function findClientAddress(db, ownerId, id) {
+  return (db.addresses || []).find((item) => item.ownerId === ownerId && item.id === id);
 }
 
 function createInventoryItem(db, body, actorId) {
@@ -285,15 +309,17 @@ function withLogActors(db, logs) {
   return logs.map((log) => ({ ...log, actor: actorInfo(db, log.actorId) }));
 }
 
-function filterAuditLogs(logs, url) {
+function filterAuditLogs(logs, url, db) {
   const query = String(url.searchParams.get("query") || "").trim().toLowerCase();
   const from = String(url.searchParams.get("from") || "").trim();
   const to = String(url.searchParams.get("to") || "").trim();
+  const role = String(url.searchParams.get("role") || "").trim();
   return logs
     .filter((log) => {
       const createdAt = log.createdAt || "";
       if (from && createdAt < `${from}T00:00:00.000Z`) return false;
       if (to && createdAt > `${to}T23:59:59.999Z`) return false;
+      if (role && actorInfo(db, log.actorId).role !== role) return false;
       if (!query) return true;
       return JSON.stringify(log).toLowerCase().includes(query);
     })
@@ -340,9 +366,13 @@ async function handleApi(req, res, url) {
     const requests = db.requests
       .filter((item) => item.ownerId === auth.user.id)
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const addresses = (db.addresses || [])
+      .filter((item) => item.ownerId === auth.user.id)
+      .sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
     return sendJson(res, 200, {
       inventory,
       requests,
+      addresses,
       stats: {
         skuCount: inventory.length,
         totalQuantity: inventory.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
@@ -352,10 +382,74 @@ async function handleApi(req, res, url) {
     });
   }
 
+  if (url.pathname === "/api/client/addresses" && req.method === "POST") {
+    assertRole(auth, "client");
+    const address = {
+      id: randomUUID(),
+      ownerId: auth.user.id,
+      label: String(body.label || "").trim(),
+      receiver: String(body.receiver || "").trim(),
+      phone: String(body.phone || "").trim(),
+      address: String(body.address || "").trim(),
+      createdAt: now(),
+      updatedAt: now()
+    };
+    db.addresses.push(address);
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "address.create",
+      entityType: "address",
+      entityId: address.id,
+      summary: `新增地址 ${address.label || address.receiver || address.address || "未命名地址"}`,
+      snapshot: address
+    });
+    await writeDb(db);
+    return sendJson(res, 201, { address });
+  }
+
+  const addressMatch = url.pathname.match(/^\/api\/client\/addresses\/([^/]+)$/);
+  if (addressMatch && req.method === "PATCH") {
+    assertRole(auth, "client");
+    const address = findClientAddress(db, auth.user.id, addressMatch[1]);
+    if (!address) return sendJson(res, 404, { error: "地址不存在" });
+    const before = { ...address };
+    for (const key of ["label", "receiver", "phone", "address"]) {
+      if (body[key] !== undefined) address[key] = String(body[key] || "").trim();
+    }
+    address.updatedAt = now();
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "address.update",
+      entityType: "address",
+      entityId: address.id,
+      summary: `修改地址 ${address.label || address.receiver || address.address || "未命名地址"}`,
+      snapshot: { before, after: address }
+    });
+    await writeDb(db);
+    return sendJson(res, 200, { address });
+  }
+
+  if (addressMatch && req.method === "DELETE") {
+    assertRole(auth, "client");
+    const index = (db.addresses || []).findIndex((item) => item.ownerId === auth.user.id && item.id === addressMatch[1]);
+    if (index === -1) return sendJson(res, 404, { error: "地址不存在" });
+    const [address] = db.addresses.splice(index, 1);
+    appendAuditLog(db, {
+      actorId: auth.user.id,
+      action: "address.delete",
+      entityType: "address",
+      entityId: address.id,
+      summary: `删除地址 ${address.label || address.receiver || address.address || "未命名地址"}`,
+      snapshot: address
+    });
+    await writeDb(db);
+    return sendJson(res, 200, { ok: true });
+  }
+
   if (url.pathname === "/api/client/requests" && req.method === "POST") {
     assertRole(auth, "client");
     const type = normalizeRequestType(body.type);
-    requireFields(body, type === "product_create" ? ["sku", "productName"] : ["type", "sku", "productName", "quantity"]);
+    requireFields(body, type === "product_create" ? ["sku", "productName"] : ["type", "sku", "productName"]);
     const product = findInventoryItem(db, auth.user.id, body.sku);
     if (type === "product_create" && product) {
       return sendJson(res, 409, { error: "该商品已经存在，请直接创建入库单" });
@@ -363,8 +457,14 @@ async function handleApi(req, res, url) {
     if (type !== "product_create" && !product) {
       return sendJson(res, 400, { error: "请先申请新增商品，审批通过后才能创建该商品的入库单" });
     }
-    if (type !== "product_create" && product.status !== "normal") {
+    if (!["product_create", "product_delete"].includes(type) && product.status !== "normal") {
       return sendJson(res, 400, { error: "该商品当前为冻结状态，暂时不能创建申请" });
+    }
+    if (type === "product_delete" && Number(product.quantity || 0) !== 0) {
+      return sendJson(res, 400, { error: "库存为 0 时才可以申请删除商品" });
+    }
+    if (!["product_create", "product_delete"].includes(type) && !String(body.quantity || "").trim()) {
+      return sendJson(res, 400, { error: "请填写商品数量" });
     }
     const request = {
       id: randomUUID(),
@@ -374,9 +474,10 @@ async function handleApi(req, res, url) {
       title: requestTitle(type, body.quantity, body.productName),
       sku: normalizeSku(body.sku),
       productName: String(body.productName || product?.name || "").trim(),
-      quantity: type === "product_create" ? 0 : Math.max(1, Number(body.quantity || 1)),
+      quantity: ["product_create", "product_delete"].includes(type) ? 0 : Math.max(1, Number(body.quantity || 1)),
       trackingNo: String(body.trackingNo || "").trim(),
       receiver: String(body.receiver || "").trim(),
+      phone: String(body.phone || "").trim(),
       address: String(body.address || "").trim(),
       note: String(body.note || "").trim(),
       createdAt: now(),
@@ -411,7 +512,7 @@ async function handleApi(req, res, url) {
 
   if (url.pathname === "/api/admin/logs" && req.method === "GET") {
     assertRole(auth, "admin");
-    return sendJson(res, 200, { logs: withLogActors(db, filterAuditLogs(db.auditLogs || [], url)) });
+    return sendJson(res, 200, { logs: withLogActors(db, filterAuditLogs(db.auditLogs || [], url, db)) });
   }
 
   if (url.pathname === "/api/admin/clients" && req.method === "POST") {
@@ -613,6 +714,23 @@ async function handleApi(req, res, url) {
           snapshot: { before: productBefore, after: product }
         });
       }
+    }
+    if (request.type === "product_delete" && before.status !== "approved" && status === "approved") {
+      const index = db.inventory.findIndex((item) => item.ownerId === request.ownerId && item.sku === request.sku);
+      if (index === -1) return sendJson(res, 404, { error: "商品不存在" });
+      if (Number(db.inventory[index].quantity || 0) !== 0) {
+        return sendJson(res, 400, { error: "库存为 0 时才可以通过删除申请" });
+      }
+      const [product] = db.inventory.splice(index, 1);
+      appendAuditLog(db, {
+        actorId: auth.user.id,
+        action: "product.delete",
+        entityType: "product",
+        entityId: product.id,
+        productInternalId: product.productInternalId,
+        summary: `审批删除商品 ${product.productInternalId || ""} / ${product.sku}`,
+        snapshot: product
+      });
     }
     request.status = status;
     request.adminNote = String(body.adminNote || request.adminNote || "").trim();
